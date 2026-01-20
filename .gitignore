@@ -1,7 +1,20 @@
+# --- Python & System ---
 venv/
 __pycache__/
 *.py[cod]
-.env
 .DS_Store
-runs/ 
-# YOLO 학습 결과 폴더 제외 (용량 큼)
+.env
+
+# --- Project Data & Artifacts ---
+# 데이터셋 폴더 (용량 큼)
+datasets/
+
+# 학습 결과 및 모델 저장 폴더 (용량 큼)
+runs/
+
+# 혹시 루트에 꺼내놓은 모델 파일이 있다면
+*.pt
+
+# 로컬 설정 파일 (Roboflow 키 등이 있을 수 있으므로)
+settings.json
+wandb/
