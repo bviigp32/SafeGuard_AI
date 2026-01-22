@@ -1,62 +1,119 @@
 import cv2
 import numpy as np
+import time
+import io
+import os
 from kafka import KafkaConsumer
 from ultralytics import YOLO
-import os
+from minio import Minio
+import psycopg2
+from datetime import datetime
 
-# 1. Kafka Consumer 설정
+# --- 설정 구간 ---
 TOPIC_NAME = 'cctv-stream'
-consumer = KafkaConsumer(
-    TOPIC_NAME,
-    bootstrap_servers='localhost:9092',
-    auto_offset_reset='latest' # 가장 최신 데이터부터 읽기 (실시간성 중요)
+MODEL_PATH = "runs/detect/safety_model/weights/best.pt" # 경로 확인!
+
+# MinIO 설정 (사진 저장소)
+minio_client = Minio(
+    "localhost:9000",
+    access_key="minioadmin",
+    secret_key="minioadmin",
+    secure=False
 )
+BUCKET_NAME = "cctv-images"
 
-# 2. YOLO 모델 로드 (어제 만든 best.pt 경로 확인 필수!)
-# 예: runs/detect/safety_model/weights/best.pt
-model_path = "runs/detect/safety_model/weights/best.pt" 
+# DB 설정 (로그 저장소)
+def get_db_connection():
+    return psycopg2.connect(
+        host="localhost",
+        port="5433", # 포트 확인!
+        database="safety_db",
+        user="user",
+        password="password"
+    )
 
-# (경로 못 찾을까봐 안전장치 - 어제 코드 재활용)
-if not os.path.exists(model_path):
-    import glob
-    list_of_files = glob.glob('runs/detect/*/weights/best.pt') 
-    if list_of_files:
-        model_path = max(list_of_files, key=os.path.getctime)
+# --- 메인 로직 ---
+def run_consumer():
+    # 1. 리소스 준비
+    consumer = KafkaConsumer(TOPIC_NAME, bootstrap_servers='localhost:9092', auto_offset_reset='latest')
+    
+    # 모델 로드 (없으면 자동 찾기)
+    if not os.path.exists(MODEL_PATH):
+        import glob
+        files = glob.glob('runs/detect/*/weights/best.pt')
+        model_path = max(files, key=os.path.getctime) if files else MODEL_PATH
     else:
-        print("모델 파일(best.pt)을 찾을 수 없습니다! 경로를 확인하세요.")
-        exit()
+        model_path = MODEL_PATH
+    
+    print(f"AI 모델 로드: {model_path}")
+    model = YOLO(model_path)
+    
+    # MinIO 버킷 확인
+    if not minio_client.bucket_exists(BUCKET_NAME):
+        minio_client.make_bucket(BUCKET_NAME)
+        print(f"MinIO 버킷 생성: {BUCKET_NAME}")
 
-print(f"모델 로드 중: {model_path}")
-model = YOLO(model_path)
+    print("감시 시스템 가동 시작...")
 
-print("Kafka에서 영상을 받아오는 중... (화면이 뜰 때까지 기다리세요)")
-
-try:
-    for msg in consumer:
-        # 3. Kafka 메시지(bytes) -> 이미지(numpy array)로 복구
-        # byte array를 numpy로 변환
-        nparr = np.frombuffer(msg.value, np.uint8)
-        # 이미지 디코딩
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if frame is None:
-            continue
-
-        # 4. YOLO 추론 (Inference)
-        results = model(frame, conf=0.7, verbose=False)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
         
-        # 5. 결과 시각화 (박스 그리기)
-        annotated_frame = results[0].plot()
+        for msg in consumer:
+            # 이미지 복원
+            nparr = np.frombuffer(msg.value, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if frame is None: continue
 
-        # 6. 화면 출력
-        cv2.imshow("SafeGuard AI - Realtime Monitor", annotated_frame)
+            # AI 추론 (conf=0.6 이상만)
+            results = model(frame, conf=0.8, verbose=False)
+            annotated_frame = results[0].plot()
 
-        # 'q' 키를 누르면 종료
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # --- [핵심] 저장 로직 ---
+            # 탐지된 객체가 있을 때만 저장 (용량 절약)
+            if len(results[0].boxes) > 0:
+                for box in results[0].boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    label = model.names[cls_id] # helmet, head, person 등
+                    
+                    # 예: 'head'(안전모 미착용)만 골라서 저장하려면?
+                    # if label == 'head': ... 로직 추가 가능
+                    
+                    # 1. 이미지 MinIO 업로드
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    filename = f"{label}_{timestamp}.jpg"
+                    
+                    # 메모리에서 바로 업로드 (디스크 저장 X)
+                    _, img_encoded = cv2.imencode('.jpg', annotated_frame)
+                    img_bytes = io.BytesIO(img_encoded)
+                    
+                    minio_client.put_object(
+                        BUCKET_NAME, filename, img_bytes, len(img_encoded), content_type="image/jpeg"
+                    )
+                    
+                    # 2. DB 로그 저장
+                    image_url = f"http://localhost:9000/{BUCKET_NAME}/{filename}"
+                    insert_query = """
+                        INSERT INTO safety_logs (violation_type, image_url, confidence)
+                        VALUES (%s, %s, %s)
+                    """
+                    cur.execute(insert_query, (label, image_url, conf))
+                    conn.commit()
+                    
+                    print(f"📸 저장 완료: {label} ({conf:.2f}) -> DB & MinIO")
 
-except KeyboardInterrupt:
-    print("\n모니터링 중단")
-finally:
-    cv2.destroyAllWindows()
-    consumer.close()
+            # 화면 출력
+            cv2.imshow("SafeGuard AI - Recording...", annotated_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except Exception as e:
+        print(f"에러 발생: {e}")
+    finally:
+        cv2.destroyAllWindows()
+        consumer.close()
+        if 'conn' in locals(): conn.close()
+
+if __name__ == "__main__":
+    run_consumer()
